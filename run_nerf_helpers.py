@@ -114,6 +114,8 @@ class NeRF(nn.Module):
             self.output_linear = nn.Linear(W, output_ch)
 
     def forward(self, x):
+        # input_pts:   positions of points / particles
+        # input_views: view directions of camera rays
         input_pts, input_views = torch.split(
             x, [self.input_ch, self.input_ch_views], dim=-1
         )
@@ -121,10 +123,13 @@ class NeRF(nn.Module):
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)
             h = F.relu(h)
+            # residual connection
             if i in self.skips:
                 h = torch.cat([input_pts, h], -1)
 
+        # train with view dependence
         if self.use_viewdirs:
+            # alpha: volume density
             alpha = self.alpha_linear(h)
             feature = self.feature_linear(h)
             h = torch.cat([feature, input_views], -1)
@@ -192,6 +197,11 @@ class NeRF(nn.Module):
 
 # Ray helpers
 def get_rays(H, W, K, c2w):
+    """
+    K[0][1] = H // 2
+    K[0][2] = W // 2
+    K[1][1] = focal length
+    """
     i, j = torch.meshgrid(
         torch.linspace(0, W - 1, W), torch.linspace(0, H - 1, H)
     )  # pytorch's meshgrid has indexing='ij'

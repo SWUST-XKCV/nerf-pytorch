@@ -44,7 +44,12 @@ def batchify(fn, chunk):
 def run_network(
     inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024 * 64
 ):
-    """Prepares inputs and applies network 'fn'."""
+    """
+    Prepares inputs and applies network 'fn'.
+    fn:           NN model
+    embed_fn:     positional encoding model for points/particles
+    embeddirs_fn: positional encoding model for directions
+    """
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
     embedded = embed_fn(inputs_flat)
 
@@ -139,9 +144,11 @@ def render(
     near, far = near * torch.ones_like(rays_d[..., :1]), far * torch.ones_like(
         rays_d[..., :1]
     )
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
+    rays = torch.cat(
+        [rays_o, rays_d, near, far], -1
+    )  # (N_rand, (3 + 3 + 1 + 1))
     if use_viewdirs:
-        rays = torch.cat([rays, viewdirs], -1)
+        rays = torch.cat([rays, viewdirs], -1)  # (N_rand, (3 + 3 + 1 + 1 + 3))
 
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
@@ -330,15 +337,16 @@ def raw2outputs(
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.0 - torch.exp(
-        -act_fn(raw) * dists
+    raw2alpha = lambda vol_density, dists, act_fn=F.relu: 1.0 - torch.exp(
+        -act_fn(vol_density) * dists
     )
 
-    dists = z_vals[..., 1:] - z_vals[..., :-1]
+    dists = z_vals[..., 1:] - z_vals[..., :-1]  # [N_rays, N_samples]
     dists = torch.cat(
         [dists, torch.Tensor([1e10]).expand(dists[..., :1].shape)], -1
-    )  # [N_rays, N_samples]
+    )  # [N_rays, N_samples + 1]
 
+    # torch.norm(rays_d[..., None, :], dim=-1) => shape: [N_rays, 1, 3]
     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
     rgb = torch.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3]
@@ -352,7 +360,8 @@ def raw2outputs(
             noise = np.random.rand(*list(raw[..., 3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
-    alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
+    vol_density = raw[..., 3]
+    alpha = raw2alpha(vol_density + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
     weights = (
         alpha
@@ -424,11 +433,14 @@ def render_rays(
     """
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]  # [N_rays, 3] each
-    viewdirs = ray_batch[:, -3:] if ray_batch.shape[-1] > 8 else None
-    bounds = torch.reshape(ray_batch[..., 6:8], [-1, 1, 2])
-    near, far = bounds[..., 0], bounds[..., 1]  # [-1,1]
+    viewdirs = ray_batch[:, -3:] if ray_batch.shape[-1] > 8 else None  # [3,]
+    bounds = torch.reshape(ray_batch[..., 6:8], [-1, 1, 2])  # [N_rays, 1 , 2]
+    near, far = (
+        bounds[..., 0],
+        bounds[..., 1],
+    )  # shape: [N_rays, 1, 1], value range: [-1,1]
 
-    t_vals = torch.linspace(0.0, 1.0, steps=N_samples)
+    t_vals = torch.linspace(0.0, 1.0, steps=N_samples)  # [N_samples,]
     if not lindisp:
         z_vals = near * (1.0 - t_vals) + far * (t_vals)
     else:
@@ -481,6 +493,7 @@ def render_rays(
             rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]
         )  # [N_rays, N_samples + N_importance, 3]
 
+        # Check if the hierarchical sampling isn't used
         run_fn = network_fn if network_fine is None else network_fine
         #         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
